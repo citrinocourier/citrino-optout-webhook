@@ -4,39 +4,58 @@ import gspread
 from fastapi import FastAPI, Request
 from oauth2client.service_account import ServiceAccountCredentials
 
+# =====================================
+# 🚀 CONFIGURACIÓN INICIAL
+# =====================================
+
 app = FastAPI()
 
-# Definir el alcance (scopes)
+# Permisos requeridos para Google Sheets y Drive
 scope = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive"
 ]
 
-# === ✅ NUEVO MÉTODO (variable de entorno) ===
-# Leer el JSON de las credenciales desde Render
+# =====================================
+# 🔐 CARGA SEGURA DE CREDENCIALES GOOGLE
+# =====================================
+
 creds_json = os.getenv("GOOGLE_CREDS_JSON")
 
 if not creds_json:
-    raise Exception("❌ GOOGLE_CREDS_JSON not found. Set it in Render Environment Variables.")
+    raise Exception("❌ GOOGLE_CREDS_JSON not found. Check your Render environment settings.")
 
-creds_dict = json.loads(creds_json)
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-client = gspread.authorize(creds)
-# ============================================
+try:
+    creds_dict = json.loads(creds_json)
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(creds)
+    print("✅ Google credentials loaded successfully.")
+except Exception as e:
+    raise Exception(f"❌ Error loading Google credentials: {e}")
 
-@app.post("/sms/optout")
-async def receive_sms(request: Request):
-    form = await request.form()
-    from_number = form.get("From")
-    body = form.get("Body", "").strip().lower()
+# =====================================
+# ✅ HEALTH CHECK PARA RENDER
+# =====================================
 
-    if body == "stop":
-        sheet = client.open("YourGoogleSheetName").sheet1
-        data = sheet.get_all_records()
-        for i, row in enumerate(data, start=2):  # Start=2 para saltar el encabezado
-            if str(row.get("Phone")) == from_number:
-                sheet.update_acell(f"M{i}", "OPT-OUT")
-                return {"message": "User opted out."}
-        return {"message": "Phone not found in sheet."}
+@app.get("/healthz")
+async def health_check():
+    return {"status": "ok", "message": "Webhook is running"}
 
-    return {"message": "No opt-out detected."}
+# =====================================
+# 🔄 ENDPOINT PRINCIPAL (EJEMPLO)
+# =====================================
+
+@app.post("/webhook")
+async def webhook_endpoint(request: Request):
+    try:
+        data = await request.json()
+        print(f"📩 Webhook received: {data}")
+
+        # Aquí va tu lógica — ejemplo de acceso a Google Sheet:
+        # sheet = client.open("TuHoja").worksheet("Sheet1")
+        # sheet.append_row([data.get("email"), "Opt-out recibido"])
+
+        return {"status": "success", "message": "Opt-out recibido correctamente"}
+    except Exception as e:
+        print(f"❌ Error procesando webhook: {e}")
+        return {"status": "error", "message": str(e)}
