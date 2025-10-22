@@ -4,16 +4,22 @@ import gspread
 from fastapi import FastAPI, Request
 from oauth2client.service_account import ServiceAccountCredentials
 
+# ================================
+# 🚀 CONFIGURACIÓN INICIAL
+# ================================
 app = FastAPI()
 
-# --- Configuración de alcance para Google Sheets ---
+# Alcances requeridos para Google Sheets y Drive
 scope = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive"
 ]
 
-# --- Cargar credenciales desde variable de entorno ---
+# ================================
+# 🔐 CREDENCIALES GOOGLE (Render)
+# ================================
 creds_json = os.getenv("GOOGLE_CREDS_JSON")
+
 if not creds_json:
     raise Exception("❌ GOOGLE_CREDS_JSON not found. Check your Render environment settings.")
 
@@ -25,23 +31,29 @@ try:
 except Exception as e:
     raise Exception(f"❌ Error loading Google credentials: {e}")
 
-# --- Ruta de salud para Render ---
+# ================================
+# ❤️ HEALTH CHECK
+# ================================
 @app.get("/healthz")
 async def health_check():
+    """Render usa este endpoint para verificar que el servicio está vivo."""
     return {"status": "ok", "message": "Webhook is running"}
 
-# --- Endpoint principal del webhook ---
+# ================================
+# 📬 WEBHOOK PRINCIPAL
+# ================================
 @app.post("/webhook")
 async def webhook_endpoint(request: Request):
     try:
         data = await request.json()
         print(f"📩 Webhook received: {data}")
 
-        # Ejemplo de lógica con Google Sheets
-        # sheet = client.open("TuHoja").worksheet("Sheet1")
+        # --- Ejemplo de escritura en Google Sheets ---
+        # sheet = client.open("NombreDeTuHoja").worksheet("Sheet1")
         # sheet.append_row([data.get("email"), "Opt-out recibido"])
 
         return {"status": "success", "message": "Opt-out recibido correctamente"}
+
     except Exception as e:
         print(f"❌ Error procesando webhook: {e}")
         return {"status": "error", "message": str(e)}
