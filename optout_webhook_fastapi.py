@@ -1,32 +1,50 @@
+import os
+import json
+import gspread
 from fastapi import FastAPI, Form
 from fastapi.responses import Response
-import gspread
 from datetime import datetime
 from twilio.twiml.messaging_response import MessagingResponse
+from oauth2client.service_account import ServiceAccountCredentials
 import uvicorn
 
+# === CONFIGURACIÓN GENERAL ===
 app = FastAPI()
 
-# === Google Sheets Config ===
 SPREADSHEET_ID = "1BZot_2EwjpGNdvypn9hyT410gKSp0neEW4ySXN8Po3E"
 SHEET_NAME = "Hoja 1"
 
-gc = gspread.service_account(filename="google-creds.json")
-ws = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+# === SCOPE NECESARIO PARA GOOGLE SHEETS ===
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
 
+# ✅ Cargar credenciales desde variable de entorno (Render)
+creds_json = os.getenv("GOOGLE_CREDS_JSON")
+
+if not creds_json:
+    raise Exception("❌ GOOGLE_CREDS_JSON not found. Check your Render environment settings.")
+
+creds_dict = json.loads(creds_json)
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+client = gspread.authorize(creds)
+print("✅ Google credentials loaded successfully.")
+
+# === HOJA DE TRABAJO ===
+ws = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+
+# === ENDPOINT PRINCIPAL (TWILIO) ===
 @app.post("/sms/optout")
 async def handle_optout(From: str = Form(...), Body: str = Form(...)):
     body = Body.strip().lower()
     print(f"📩 Mensaje recibido de {From}: {body}")
 
-    # Twilio Response
     response = MessagingResponse()
-
-    # Palabras clave de baja
     keywords = ["stop", "baja", "unsubscribe", "cancelar", "salir"]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # === REGISTRO DE CADA MENSAJE ===
+    # Registrar todo mensaje recibido
     ws.append_row([now, From, Body, "SMS", "Received"])
 
     # === MANEJO DE OPT-OUT ===
@@ -41,7 +59,6 @@ async def handle_optout(From: str = Form(...), Body: str = Form(...)):
                 print(f"✅ {From} marcado como OPT_OUT en fila {i}")
                 break
 
-        # Registrar también en log general
         ws.append_row([now, From, Body, "SMS", "Opt-out"])
         response.message("Has sido dado de baja de los mensajes de Citrino Courier. 🟢 Gracias.")
     else:
@@ -49,5 +66,7 @@ async def handle_optout(From: str = Form(...), Body: str = Form(...)):
 
     return Response(content=str(response), media_type="application/xml")
 
+# === EJECUCIÓN LOCAL ===
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=10000)
+
