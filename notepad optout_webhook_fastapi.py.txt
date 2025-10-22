@@ -1,11 +1,19 @@
+import os, json
 from fastapi import FastAPI, Request
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 app = FastAPI()
 
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("google-creds.json", scope)
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
+
+# ✅ Leer credenciales desde variable de entorno en Render
+creds_json = os.getenv("GOOGLE_CREDS_JSON")
+creds_dict = json.loads(creds_json)
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
 @app.post("/sms/optout")
@@ -13,7 +21,7 @@ async def receive_sms(request: Request):
     form = await request.form()
     from_number = form.get("From")
     body = form.get("Body", "").strip().lower()
-    
+
     if body == "stop":
         sheet = client.open("YourGoogleSheetName").sheet1
         data = sheet.get_all_records()
@@ -22,3 +30,7 @@ async def receive_sms(request: Request):
                 sheet.update_acell(f"M{i}", "OPT-OUT")
                 return {"message": "User opted out."}
     return {"message": "No opt-out detected."}
+
+@app.get("/healthz")
+def health_check():
+    return {"status": "ok"}
