@@ -1,20 +1,28 @@
-import os, json
-from fastapi import FastAPI, Request
+import os
+import json
 import gspread
+from fastapi import FastAPI, Request
 from oauth2client.service_account import ServiceAccountCredentials
 
 app = FastAPI()
 
+# Definir el alcance (scopes)
 scope = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive"
 ]
 
-# ✅ Leer credenciales desde variable de entorno en Render
+# === ✅ NUEVO MÉTODO (variable de entorno) ===
+# Leer el JSON de las credenciales desde Render
 creds_json = os.getenv("GOOGLE_CREDS_JSON")
+
+if not creds_json:
+    raise Exception("❌ GOOGLE_CREDS_JSON not found. Set it in Render Environment Variables.")
+
 creds_dict = json.loads(creds_json)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
+# ============================================
 
 @app.post("/sms/optout")
 async def receive_sms(request: Request):
@@ -25,12 +33,10 @@ async def receive_sms(request: Request):
     if body == "stop":
         sheet = client.open("YourGoogleSheetName").sheet1
         data = sheet.get_all_records()
-        for i, row in enumerate(data, start=2):  # Start=2 to skip header
-            if str(row.get("Phone")) in from_number:
+        for i, row in enumerate(data, start=2):  # Start=2 para saltar el encabezado
+            if str(row.get("Phone")) == from_number:
                 sheet.update_acell(f"M{i}", "OPT-OUT")
                 return {"message": "User opted out."}
-    return {"message": "No opt-out detected."}
+        return {"message": "Phone not found in sheet."}
 
-@app.get("/healthz")
-def health_check():
-    return {"status": "ok"}
+    return {"message": "No opt-out detected."}
