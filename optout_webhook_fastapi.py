@@ -11,7 +11,7 @@ import uvicorn
 # === CONFIGURACIÓN GENERAL ===
 app = FastAPI()
 
-SPREADSHEET_ID = "https://docs.google.com/spreadsheets/d/1BZOT_2EwjpGNdvypn9hyT41OgKSpOneEW4ySXN8Po3E/edit?gid=772185626#gid=772185626"
+SPREADSHEET_ID = "1BZOT_2EwjpGNdvypn9hyT41OgKSpOneEW4ySXN8Po3E"
 SHEET_NAME = "Hoja 1"
 
 # === SCOPE NECESARIO PARA GOOGLE SHEETS ===
