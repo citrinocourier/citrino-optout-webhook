@@ -30,9 +30,17 @@ creds_dict = json.loads(creds_json)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 print("✅ Google credentials loaded successfully.")
+# --- Diagnóstico de Google Sheets ---
+try:
+    ss = client.open_by_key(SPREADSHEET_ID)
+    titles = [ws.title for ws in ss.worksheets()]
+    print(f"🗂️  Spreadsheet OK. Worksheets: {titles}")
+except Exception as e:
+    print(f"❌ No se pudo abrir el Spreadsheet con ID={SPREADSHEET_ID}. Error: {e}")
+    raise
 
 # === HOJA DE TRABAJO ===
-ws = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+ws = ss.worksheet(SHEET_NAME)
 
 # === ENDPOINT PRINCIPAL (TWILIO) ===
 @app.post("/sms/optout")
