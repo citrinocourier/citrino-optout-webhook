@@ -1,80 +1,106 @@
-import os
-import json
+# optout_webhook_fastapi.py
+import os, re, json, time, logging
 import gspread
 from fastapi import FastAPI, Form
 from fastapi.responses import Response
 from datetime import datetime
 from twilio.twiml.messaging_response import MessagingResponse
-from oauth2client.service_account import ServiceAccountCredentials
-import uvicorn
 
-# === CONFIGURACIÓN GENERAL ===
 app = FastAPI()
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
+log = logging.getLogger("optout")
 
-SPREADSHEET_ID = "1BZOT_2EwjpGNdvypn9hyT41OgKSpOneEW4ySXN8Po3E"
-SHEET_NAME = "Hoja 1"
-
-# === SCOPE NECESARIO PARA GOOGLE SHEETS ===
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
 ]
 
-# ✅ Cargar credenciales desde variable de entorno (Render)
-creds_json = os.getenv("GOOGLE_CREDS_JSON")
+def normalize_sheet_id(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        raise RuntimeError("Falta SPREADSHEET_ID")
+    if "/d/" in raw:
+        raw = raw.split("/d/")[1].split("/")[0]
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,}", raw):
+        raise RuntimeError("SPREADSHEET_ID inválido (revisa O/0, l/I)")
+    return raw
 
+# Credenciales
+creds_json = os.getenv("GOOGLE_CREDS_JSON") or ""
 if not creds_json:
-    raise Exception("❌ GOOGLE_CREDS_JSON not found. Check your Render environment settings.")
+    raise RuntimeError("Falta GOOGLE_CREDS_JSON")
+gclient = gspread.service_account_from_dict(json.loads(creds_json), scopes=SCOPES)
 
-creds_dict = json.loads(creds_json)
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-client = gspread.authorize(creds)
-print("✅ Google credentials loaded successfully.")
-# --- Diagnóstico de Google Sheets ---
-try:
-    ss = client.open_by_key(SPREADSHEET_ID)
-    titles = [ws.title for ws in ss.worksheets()]
-    print(f"🗂️  Spreadsheet OK. Worksheets: {titles}")
-except Exception as e:
-    print(f"❌ No se pudo abrir el Spreadsheet con ID={SPREADSHEET_ID}. Error: {e}")
-    raise
+_ws_cache = None
+def get_ws():
+    global _ws_cache
+    if _ws_cache is not None:
+        return _ws_cache
+    sid = normalize_sheet_id(os.getenv("SPREADSHEET_ID"))
+    sname = os.getenv("SHEET_NAME", "Hoja 1")
+    log.info("Inicializando Sheets: %s...%s / tab='%s'", sid[:6], sid[-6:], sname)
+    for attempt in range(4):
+        try:
+            ss = gclient.open_by_key(sid)
+            try:
+                ws = ss.worksheet(sname)
+            except gspread.WorksheetNotFound:
+                ws = ss.get_worksheet(0)
+            _ws_cache = ws
+            return ws
+        except Exception as e:
+            wait = 2 ** attempt
+            log.warning("get_ws fallo intento %s: %s -> retry %ss", attempt+1, e, wait)
+            time.sleep(wait)
+    raise RuntimeError("No se pudo abrir el worksheet tras reintentos")
 
-# === HOJA DE TRABAJO ===
-ws = ss.worksheet(SHEET_NAME)
+@app.get("/health")
+def health():
+    try:
+        ws = get_ws()
+        return {"ok": True, "sheet": ws.spreadsheet.title, "tab": ws.title}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-# === ENDPOINT PRINCIPAL (TWILIO) ===
 @app.post("/sms/optout")
 async def handle_optout(From: str = Form(...), Body: str = Form(...)):
-    body = Body.strip().lower()
-    print(f"📩 Mensaje recibido de {From}: {body}")
-
-    response = MessagingResponse()
-    keywords = ["stop", "baja", "unsubscribe", "cancelar", "salir"]
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # Registrar todo mensaje recibido
-    ws.append_row([now, From, Body, "SMS", "Received"])
-
-    # === MANEJO DE OPT-OUT ===
-    if any(k in body for k in keywords):
-        rows = ws.get_all_records()
-        for i, row in enumerate(rows, start=2):
-            phone = str(row.get("Phone", "")).strip()
-            clean_number = "+1" + phone if not phone.startswith("+") else phone
-            if clean_number.endswith(From[-10:]):
-                ws.update_acell(f"F{i}", "OPT_OUT")
-                ws.update_acell(f"L{i}", f"STOP {now}")
-                print(f"✅ {From} marcado como OPT_OUT en fila {i}")
+    resp = MessagingResponse()
+    try:
+        ws = get_ws()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        body = (Body or "").strip().lower()
+        src  = (From or "").strip()
+        # log recepción
+        for _ in range(2):
+            try:
+                ws.append_row([now, src, Body, "SMS", "Received"])
                 break
+            except Exception as e:
+                log.warning("append_row(Received) %s -> retry", e)
+                time.sleep(1)
 
-        ws.append_row([now, From, Body, "SMS", "Opt-out"])
-        response.message("Has sido dado de baja de los mensajes de Citrino Courier. 🟢 Gracias.")
-    else:
-        response.message("Mensaje recibido ✅. Si deseas dejar de recibir mensajes, responde STOP.")
+        keywords = {"stop","baja","unsubscribe","cancelar","salir"}
+        if any(k in body for k in keywords):
+            rows = ws.get_all_records()
+            tail = re.sub(r"\D", "", src)[-10:]
+            updated = False
+            for i, row in enumerate(rows, start=2):
+                digits = re.sub(r"\D", "", str(row.get("Phone","")))[-10:]
+                if digits and digits == tail:
+                    ws.update_acell(f"F{i}", "OPT_OUT")
+                    ws.update_acell(f"L{i}", f"STOP {now}")
+                    updated = True
+                    log.info("OPT_OUT en fila %s", i)
+                    break
+            ws.append_row([now, src, Body, "SMS", "Opt-out" + ("" if updated else " (no match)")])
+            resp.message("Has sido dado de baja de los mensajes de Citrino Courier. 🟢 Gracias.")
+        else:
+            resp.message("Mensaje recibido ✅. Si deseas dejar de recibir mensajes, responde STOP.")
+        return Response(content=str(resp), media_type="application/xml")
 
-    return Response(content=str(response), media_type="application/xml")
+    except Exception as e:
+        log.error("optout ERROR: %s", e)
+        resp.message("Error temporal procesando tu solicitud. Intenta de nuevo en unos minutos.")
+        return Response(content=str(resp), media_type="application/xml", status_code=200)
 
-# === EJECUCIÓN LOCAL ===
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=10000)
 
