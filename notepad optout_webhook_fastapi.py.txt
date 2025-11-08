@@ -1,58 +1,191 @@
 import os
 import json
+from datetime import datetime, timezone
+from typing import Optional
+
 import gspread
 from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse, JSONResponse
 from oauth2client.service_account import ServiceAccountCredentials
 
-# ================================
-# 🚀 CONFIGURACIÓN INICIAL
-# ================================
+# ======================================
+# App
+# ======================================
 app = FastAPI()
 
-# Alcances requeridos para Google Sheets y Drive
-scope = [
+# ======================================
+# Google auth
+# ======================================
+SCOPES = [
     "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/drive",
 ]
 
-# ================================
-# 🔐 CREDENCIALES GOOGLE (Render)
-# ================================
-creds_json = os.getenv("GOOGLE_CREDS_JSON")
-
-if not creds_json:
-    raise Exception("❌ GOOGLE_CREDS_JSON not found. Check your Render environment settings.")
+CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
+if not CREDS_JSON:
+    raise RuntimeError("GOOGLE_CREDS_JSON not set")
 
 try:
-    creds_dict = json.loads(creds_json)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client = gspread.authorize(creds)
-    print("✅ Google credentials loaded successfully.")
+    CREDS = ServiceAccountCredentials.from_json_keyfile_dict(
+        json.loads(CREDS_JSON), SCOPES
+    )
+    GCLIENT = gspread.authorize(CREDS)
 except Exception as e:
-    raise Exception(f"❌ Error loading Google credentials: {e}")
+    raise RuntimeError(f"Google auth failed: {e}")
 
-# ================================
-# ❤️ HEALTH CHECK
-# ================================
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
+SHEET_NAME      = os.getenv("SHEET_NAME", "").strip()  # alternativa si no usas ID
+WORKSHEET_NAME  = os.getenv("WORKSHEET_NAME", "OPT-OUT LOGS").strip() or "OPT-OUT LOGS"
+
+
+# Helpers -------------------------------------------------
+def now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def open_spreadsheet():
+    if SPREADSHEET_ID:
+        return GCLIENT.open_by_key(SPREADSHEET_ID)
+    if SHEET_NAME:
+        return GCLIENT.open(SHEET_NAME)
+    raise RuntimeError("Set SPREADSHEET_ID or SHEET_NAME in env")
+
+
+def get_ws():
+    ss = open_spreadsheet()
+    try:
+        ws = ss.worksheet(WORKSHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(title=WORKSHEET_NAME, rows=1000, cols=10)
+        # encabezados estándar
+        ws.update("A1:H1", [[
+            "timestamp","from","keyword","channel","status","action","reason","to"
+        ]])
+        ws.freeze(rows=1)
+    return ws
+
+
+def append_row(ws, values):
+    # values: [timestamp, from, keyword, channel, status, action, reason, to]
+    ws.append_row(values, value_input_option="RAW", table_range="A1")
+
+
+# ======================================
+# Filtro anti-errores (solo STOP/START/HELP o texto corto sin trazas)
+# ======================================
+def should_log_message(body: Optional[str]) -> bool:
+    if not body:
+        return False
+    b = body.strip().lower()
+    valid = {"stop", "start", "help"}
+    if b in valid:
+        return True
+    # permitir texto corto de usuario, pero filtrar trazas típicas
+    if len(b) <= 160:
+        noise = [
+            "http error",
+            "twilio returned",
+            "unable to create record",
+            "invalid",
+            "error:",
+            "21610",
+            "21211",
+            "21212",
+        ]
+        if any(x in b for x in noise):
+            return False
+        return True
+    return False
+
+
+# ======================================
+# Health
+# ======================================
 @app.get("/healthz")
-async def health_check():
-    """Render usa este endpoint para verificar que el servicio está vivo."""
-    return {"status": "ok", "message": "Webhook is running"}
+def healthz():
+    try:
+        ss = open_spreadsheet()
+        return {
+            "status": "ok",
+            "sheet_title": ss.title,
+            "worksheet": WORKSHEET_NAME,
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
-# ================================
-# 📬 WEBHOOK PRINCIPAL
-# ================================
+
+# ======================================
+# Twilio Inbound SMS webhook
+# Twilio -> POST x-www-form-urlencoded con From, To, Body
+# ======================================
+@app.post("/sms/optout")
+async def sms_optout(request: Request):
+    form = await request.form()
+    From = (form.get("From") or "").strip()
+    To   = (form.get("To") or "").strip()
+    Body = (form.get("Body") or "").strip()
+
+    # Filtrar ruido técnico
+    if not should_log_message(Body):
+        return PlainTextResponse("<Response></Response>", media_type="application/xml")
+
+    body_lc = Body.lower()
+    if body_lc == "stop":
+        action_label = "Opt-out"
+        status = "Received"
+        reason = "user_sent_stop"
+        reply = "Has sido dado de baja de los mensajes de Citrino Courier. 🟢 Gracias."
+    elif body_lc == "start":
+        action_label = "Opt-in"
+        status = "Received"
+        reason = "user_sent_start"
+        reply = "Has sido dado de alta nuevamente. ✅"
+    elif body_lc == "help":
+        action_label = "Help"
+        status = "Received"
+        reason = "user_asked_help"
+        reply = "Ayuda: Responde STOP para salir, START para volver a entrar."
+    else:
+        action_label = "Message"
+        status = "Received"
+        reason = "free_text"
+        reply = "Recibido. Gracias."
+
+    # Escribir a Google Sheets
+    try:
+        ws = get_ws()
+        append_row(ws, [
+            now_str(),
+            From,
+            Body,
+            "SMS",
+            status,
+            action_label,
+            reason,
+            To,
+        ])
+    except Exception as e:
+        # no bloquear respuesta a Twilio aunque falle la hoja
+        print(f"[Sheets error] {e}")
+
+    twiml = f"<Response><Message>{reply}</Message></Response>"
+    return PlainTextResponse(twiml, media_type="application/xml")
+
+
+# ======================================
+# Tu webhook genérico existente (JSON)
+# ======================================
 @app.post("/webhook")
 async def webhook_endpoint(request: Request):
     try:
         data = await request.json()
-        print(f"📩 Webhook received: {data}")
-
-        # --- Ejemplo de escritura en Google Sheets ---
-        # sheet = client.open("NombreDeTuHoja").worksheet("Sheet1")
-        # sheet.append_row([data.get("email"), "Opt-out recibido"])
-
-        return {"status": "success", "message": "Opt-out recibido correctamente"}
+        print(f"[Webhook] {data}")
+        # ejemplo de uso: escribe si quieres a otra hoja
+        # ws = get_ws()
+        # ws.append_row([now_str(), data.get("email",""), "webhook"])
+        return {"status": "success"}
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"status": "error", "detail": str(e)})
 
     except Exception as e:
         print(f"❌ Error procesando webhook: {e}")
