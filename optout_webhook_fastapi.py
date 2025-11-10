@@ -1,33 +1,41 @@
 # optout_webhook_fastapi.py
 import os, re, json, time, logging
+from datetime import datetime, timezone
+from typing import Optional, Iterable, List
+
 import gspread
 from fastapi import FastAPI, Form
-from fastapi.responses import Response
-from datetime import datetime
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from oauth2client.service_account import ServiceAccountCredentials
 from twilio.twiml.messaging_response import MessagingResponse
-from fastapi import Response
-from fastapi.responses import JSONResponse
 
-@app.get("/healthz", response_class=JSONResponse)
-def healthz():
-    return {"ok": True, "service": "citrino-optout-webhook"}
-
-@app.get("/", response_class=JSONResponse)
-def root():
-    return {"ok": True}
-
-@app.head("/", include_in_schema=False)
-def root_head():
-    # para que los HEAD checks de Render no devuelvan 404
-    return Response(status_code=200)
-
-app = FastAPI()
-logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
+# ===================== App & log =====================
+app = FastAPI(title="Citrino Opt-Out Webhook")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("optout")
 
+# ===================== Google auth =====================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
+]
+
+CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON") or ""
+if not CREDS_JSON:
+    raise RuntimeError("Falta GOOGLE_CREDS_JSON")
+
+try:
+    CREDS = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(CREDS_JSON), SCOPES)
+    GCLIENT = gspread.authorize(CREDS)
+except Exception as e:
+    raise RuntimeError(f"Google auth failed: {e}")
+
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
+SHEET_NAME     = os.getenv("SHEET_NAME", "").strip()          # alternativo si no usas ID
+WORKSHEET_NAME = (os.getenv("WORKSHEET_NAME", "OPT-OUT LOGS") or "OPT-OUT LOGS").strip()
+
+EXPECTED_HEADERS: List[str] = [
+    "timestamp","from","keyword","channel","status","action","reason","to"
 ]
 
 def normalize_sheet_id(raw: str) -> str:
@@ -40,82 +48,138 @@ def normalize_sheet_id(raw: str) -> str:
         raise RuntimeError("SPREADSHEET_ID inválido (revisa O/0, l/I)")
     return raw
 
-# Credenciales
-creds_json = os.getenv("GOOGLE_CREDS_JSON") or ""
-if not creds_json:
-    raise RuntimeError("Falta GOOGLE_CREDS_JSON")
-gclient = gspread.service_account_from_dict(json.loads(creds_json), scopes=SCOPES)
+def open_spreadsheet():
+    if SPREADSHEET_ID:
+        return GCLIENT.open_by_key(normalize_sheet_id(SPREADSHEET_ID))
+    if SHEET_NAME:
+        return GCLIENT.open(SHEET_NAME)
+    raise RuntimeError("Configura SPREADSHEET_ID o SHEET_NAME en las variables de entorno")
 
-_ws_cache = None
-def get_ws():
-    global _ws_cache
-    if _ws_cache is not None:
-        return _ws_cache
-    sid = normalize_sheet_id(os.getenv("SPREADSHEET_ID"))
-    sname = os.getenv("SHEET_NAME", "Hoja 1")
-    log.info("Inicializando Sheets: %s...%s / tab='%s'", sid[:6], sid[-6:], sname)
-    for attempt in range(4):
+def ensure_ws():
+    """Obtiene o crea la hoja de trabajo y asegura los encabezados."""
+    ss = open_spreadsheet()
+    try:
+        ws = ss.worksheet(WORKSHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(title=WORKSHEET_NAME, rows=1000, cols=10)
+
+    try:
+        header = ws.get_values("1:1")
+        header = header[0] if header else []
+    except Exception:
+        header = []
+
+    if header[:len(EXPECTED_HEADERS)] != EXPECTED_HEADERS:
+        ws.clear()
+        ws.update("A1:H1", [EXPECTED_HEADERS])
+        ws.freeze(rows=1)
+    return ws
+
+def backoff_delays() -> Iterable[float]:
+    for d in (0.3, 0.6, 1.2, 2.5):
+        yield d
+
+def sheets_append_row(values: List[str]) -> None:
+    """Append con reintentos suaves para evitar 429/5xx."""
+    last_err = None
+    for delay in backoff_delays():
         try:
-            ss = gclient.open_by_key(sid)
-            try:
-                ws = ss.worksheet(sname)
-            except gspread.WorksheetNotFound:
-                ws = ss.get_worksheet(0)
-            _ws_cache = ws
-            return ws
+            ws = ensure_ws()
+            ws.append_row(values, value_input_option="RAW", table_range="A1")
+            return
         except Exception as e:
-            wait = 2 ** attempt
-            log.warning("get_ws fallo intento %s: %s -> retry %ss", attempt+1, e, wait)
-            time.sleep(wait)
-    raise RuntimeError("No se pudo abrir el worksheet tras reintentos")
+            last_err = e
+            log.warning("append_row fallo: %s -> retry %.1fs", e, delay)
+            time.sleep(delay)
+    # intento final
+    ws = ensure_ws()
+    ws.append_row(values, value_input_option="RAW", table_range="A1")
 
-@app.get("/health")
-def health():
+def now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def should_log_message(body: Optional[str]) -> bool:
+    if not body:
+        return False
+    b = body.strip().lower()
+    if b in {"stop", "start", "help"}:
+        return True
+    # permitir texto breve humano y filtrar trazas típicas
+    if len(b) <= 160 and not any(x in b for x in (
+        "http error", "twilio returned", "unable to create record", "invalid", "error:",
+        "21610", "21211", "21212"
+    )):
+        return True
+    return False
+
+# ===================== Health & root =====================
+@app.get("/healthz", response_class=JSONResponse)
+def healthz():
     try:
-        ws = get_ws()
-        return {"ok": True, "sheet": ws.spreadsheet.title, "tab": ws.title}
+        ss = open_spreadsheet()
+        ensure_ws()  # valida acceso a la pestaña
+        return {"ok": True, "sheet": ss.title, "tab": WORKSHEET_NAME}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
+@app.get("/", response_class=JSONResponse)
+def root():
+    return {"ok": True, "service": "citrino-optout-webhook"}
+
+@app.head("/", include_in_schema=False)
+def root_head():
+    # Para que los HEAD checks de Render no devuelvan 404
+    return Response(status_code=200)
+
+# ===================== Twilio inbound =====================
 @app.post("/sms/optout")
-async def handle_optout(From: str = Form(...), Body: str = Form(...)):
-    resp = MessagingResponse()
+async def sms_optout(
+    From: str = Form(...),
+    To:   str = Form(""),
+    Body: str = Form("")
+):
+    """
+    Twilio envía application/x-www-form-urlencoded con From, To, Body
+    """
+    msg = MessagingResponse()
+
+    if not should_log_message(Body):
+        # Responder vacío pero válido para Twilio si es ruido técnico
+        return PlainTextResponse("<Response></Response>", media_type="application/xml")
+
+    b = (Body or "").strip().lower()
+    if b == "stop":
+        action, status, reason, reply = (
+            "Opt-out", "Received", "user_sent_stop",
+            "Has sido dado de baja de los mensajes de Citrino Courier. 🟢 Gracias."
+        )
+    elif b == "start":
+        action, status, reason, reply = (
+            "Opt-in", "Received", "user_sent_start",
+            "Has sido dado de alta nuevamente. ✅"
+        )
+    elif b == "help":
+        action, status, reason, reply = (
+            "Help", "Received", "user_asked_help",
+            "Ayuda: Responde STOP para salir, START para volver a entrar."
+        )
+    else:
+        action, status, reason, reply = ("Message", "Received", "free_text", "Recibido. Gracias.")
+
+    # Log → Google Sheets con 8 columnas esperadas
     try:
-        ws = get_ws()
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        body = (Body or "").strip().lower()
-        src  = (From or "").strip()
-        # log recepción
-        for _ in range(2):
-            try:
-                ws.append_row([now, src, Body, "SMS", "Received"])
-                break
-            except Exception as e:
-                log.warning("append_row(Received) %s -> retry", e)
-                time.sleep(1)
-
-        keywords = {"stop","baja","unsubscribe","cancelar","salir"}
-        if any(k in body for k in keywords):
-            rows = ws.get_all_records()
-            tail = re.sub(r"\D", "", src)[-10:]
-            updated = False
-            for i, row in enumerate(rows, start=2):
-                digits = re.sub(r"\D", "", str(row.get("Phone","")))[-10:]
-                if digits and digits == tail:
-                    ws.update_acell(f"F{i}", "OPT_OUT")
-                    ws.update_acell(f"L{i}", f"STOP {now}")
-                    updated = True
-                    log.info("OPT_OUT en fila %s", i)
-                    break
-            ws.append_row([now, src, Body, "SMS", "Opt-out" + ("" if updated else " (no match)")])
-            resp.message("Has sido dado de baja de los mensajes de Citrino Courier. 🟢 Gracias.")
-        else:
-            resp.message("Mensaje recibido ✅. Si deseas dejar de recibir mensajes, responde STOP.")
-        return Response(content=str(resp), media_type="application/xml")
-
+        sheets_append_row([
+            now_str(),
+            (From or "").strip(),
+            (Body or "").strip(),
+            "SMS",
+            status,
+            action,
+            reason,
+            (To or "").strip(),
+        ])
     except Exception as e:
-        log.error("optout ERROR: %s", e)
-        resp.message("Error temporal procesando tu solicitud. Intenta de nuevo en unos minutos.")
-        return Response(content=str(resp), media_type="application/xml", status_code=200)
+        log.error("[Sheets error] %s", e)
 
-
+    msg.message(reply)
+    return PlainTextResponse(str(msg), media_type="application/xml")
