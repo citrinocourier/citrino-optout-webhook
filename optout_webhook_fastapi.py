@@ -5,6 +5,21 @@ from fastapi import FastAPI, Form
 from fastapi.responses import Response
 from datetime import datetime
 from twilio.twiml.messaging_response import MessagingResponse
+from fastapi import Response
+from fastapi.responses import JSONResponse
+
+@app.get("/healthz", response_class=JSONResponse)
+def healthz():
+    return {"ok": True, "service": "citrino-optout-webhook"}
+
+@app.get("/", response_class=JSONResponse)
+def root():
+    return {"ok": True}
+
+@app.head("/", include_in_schema=False)
+def root_head():
+    # para que los HEAD checks de Render no devuelvan 404
+    return Response(status_code=200)
 
 app = FastAPI()
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
